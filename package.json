@@ -1,0 +1,15 @@
+{
+  "name": "war-room",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "concurrently \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "dev:server": "npm run dev --prefix server",
+    "dev:client": "npm run dev --prefix client",
+    "train:audio-model": "python3 ml/train_models.py",
+    "smoke:test": "./scripts/smoke_test.sh"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
