@@ -1,11 +1,34 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
-import { MapContainer, Marker, TileLayer, Tooltip, useMap } from "react-leaflet";
+import { Circle, MapContainer, Marker, Polygon, Polyline, TileLayer, Tooltip, useMap } from "react-leaflet";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:4000";
-const POLL_INTERVAL_MS = 2000;
-const STALE_AFTER_MS = 8000;
 const THRESHOLD_STORAGE_KEY = "war-room-alert-thresholds-v1";
+const SYNC_MODE_STORAGE_KEY = "war-room-sync-mode-v1";
+const DEFAULT_SYNC_MODE = "normal";
+const SYNC_MODES = {
+  normal: {
+    label: "Normal",
+    description: "Data sync every 15 seconds",
+    pollIntervalMs: 15_000,
+    staleAfterMs: 45_000,
+    useLiveStream: false
+  },
+  combat: {
+    label: "Combat",
+    description: "Data sync every 3 seconds",
+    pollIntervalMs: 3_000,
+    staleAfterMs: 12_000,
+    useLiveStream: false
+  },
+  emergency: {
+    label: "Emergency",
+    description: "Live stream mode (SSE)",
+    pollIntervalMs: 1_000,
+    staleAfterMs: 8_000,
+    useLiveStream: true
+  }
+};
 const DEFAULT_ALERT_THRESHOLDS = {
   spo2: { min: 90, max: 100 },
   systolic: { min: 90, max: 140 },
@@ -119,11 +142,40 @@ const markerIcon = (soldier, selected) => {
   });
 };
 
+const directionArrowIcon = ({ bearingDeg, active }) =>
+  L.divIcon({
+    className: "direction-arrow-wrap",
+    html: `
+      <div class="direction-arrow ${active ? "direction-arrow-active" : ""}" style="transform: rotate(${bearingDeg}deg)">
+        ▲
+      </div>
+    `,
+    iconSize: [20, 20],
+    iconAnchor: [10, 10]
+  });
+
+const getDummyBearing = (id) => {
+  let hash = 0;
+  for (let i = 0; i < id.length; i += 1) {
+    hash = ((hash << 5) - hash) + id.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash) % 360;
+};
+
+const projectByDistance = ({ lat, lng, bearingDeg, meters }) => {
+  const bearing = (Number(bearingDeg) * Math.PI) / 180;
+  const dLat = (meters * Math.cos(bearing)) / 111_320;
+  const dLng = (meters * Math.sin(bearing)) / (111_320 * Math.cos((lat * Math.PI) / 180));
+  return [lat + dLat, lng + dLng];
+};
+
 const MapActionButtons = ({ soldiers, selectedSoldier }) => {
   const map = useMap();
   const zoomTimerRef = useRef(null);
   const lastFocusedSoldierRef = useRef("");
   const lastAutoFitBoundsRef = useRef(null);
+  const hasInitialFitRef = useRef(false);
 
   useEffect(() => {
     const stopZoomLoop = () => {
@@ -135,27 +187,18 @@ const MapActionButtons = ({ soldiers, selectedSoldier }) => {
 
     const startZoomLoop = (direction) => {
       if (zoomTimerRef.current) return;
-
       const run = () => {
         const currentZoom = map.getZoom();
         const maxZoom = map.getMaxZoom();
         const minZoom = map.getMinZoom();
-
         if (direction > 0) {
-          if (currentZoom >= maxZoom) {
-            stopZoomLoop();
-            return;
-          }
+          if (currentZoom >= maxZoom) return stopZoomLoop();
           map.zoomIn();
         } else {
-          if (currentZoom <= minZoom) {
-            stopZoomLoop();
-            return;
-          }
+          if (currentZoom <= minZoom) return stopZoomLoop();
           map.zoomOut();
         }
       };
-
       run();
       zoomTimerRef.current = window.setInterval(run, 110);
     };
@@ -165,7 +208,6 @@ const MapActionButtons = ({ soldiers, selectedSoldier }) => {
         event.preventDefault();
         startZoomLoop(1);
       }
-
       if (event.key === "-") {
         event.preventDefault();
         startZoomLoop(-1);
@@ -179,11 +221,9 @@ const MapActionButtons = ({ soldiers, selectedSoldier }) => {
     };
 
     const onBlur = () => stopZoomLoop();
-
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
-
     return () => {
       stopZoomLoop();
       window.removeEventListener("keydown", onKeyDown);
@@ -194,45 +234,42 @@ const MapActionButtons = ({ soldiers, selectedSoldier }) => {
 
   const fitAll = () => {
     if (!soldiers.length) return;
-    const bounds = L.latLngBounds(
-      soldiers.map((soldier) => [soldier.coordinates.lat, soldier.coordinates.lng])
-    );
+    const bounds = L.latLngBounds(soldiers.map((soldier) => [soldier.coordinates.lat, soldier.coordinates.lng]));
     map.fitBounds(bounds, { padding: [40, 40] });
     lastAutoFitBoundsRef.current = computeFleetBounds(soldiers);
   };
 
   const focusSelected = () => {
     if (!selectedSoldier) return;
-    map.flyTo([selectedSoldier.coordinates.lat, selectedSoldier.coordinates.lng], 18, {
-      duration: 0.7
-    });
+    map.panTo([selectedSoldier.coordinates.lat, selectedSoldier.coordinates.lng], { animate: true, duration: 0.7 });
   };
 
   useEffect(() => {
     if (!selectedSoldier) return;
     if (lastFocusedSoldierRef.current === selectedSoldier.id) return;
-
-    const targetZoom = Math.max(map.getZoom(), 18);
-    map.flyTo([selectedSoldier.coordinates.lat, selectedSoldier.coordinates.lng], targetZoom, {
-      duration: 0.7
-    });
+    map.panTo([selectedSoldier.coordinates.lat, selectedSoldier.coordinates.lng], { animate: true, duration: 0.7 });
     lastFocusedSoldierRef.current = selectedSoldier.id;
   }, [map, selectedSoldier]);
 
   useEffect(() => {
     if (!soldiers.length || selectedSoldier) return;
 
+    if (!hasInitialFitRef.current) {
+      const bounds = L.latLngBounds(soldiers.map((soldier) => [soldier.coordinates.lat, soldier.coordinates.lng]));
+      map.fitBounds(bounds, { padding: [40, 40] });
+      lastAutoFitBoundsRef.current = computeFleetBounds(soldiers);
+      hasInitialFitRef.current = true;
+      lastFocusedSoldierRef.current = "";
+      return;
+    }
+
     const currentBounds = computeFleetBounds(soldiers);
     const shouldRefit = hasMeaningfulBoundsShift(lastAutoFitBoundsRef.current, currentBounds);
-
     if (shouldRefit) {
-      const bounds = L.latLngBounds(
-        soldiers.map((soldier) => [soldier.coordinates.lat, soldier.coordinates.lng])
-      );
+      const bounds = L.latLngBounds(soldiers.map((soldier) => [soldier.coordinates.lat, soldier.coordinates.lng]));
       map.fitBounds(bounds, { padding: [40, 40] });
       lastAutoFitBoundsRef.current = currentBounds;
     }
-
     lastFocusedSoldierRef.current = "";
   }, [map, soldiers, selectedSoldier]);
 
@@ -255,9 +292,69 @@ const outOfRangeReason = (label, value, range) => {
   return "";
 };
 
+const normalizeSquadIntelForDiff = (value) => {
+  if (!value || typeof value !== "object") return value;
+  const { timestamp, ...rest } = value;
+  return rest;
+};
+
+const formatOperationReplayTs = (rawTs, viewMode = "timestamp") => {
+  const ts = String(rawTs || "");
+  if (!ts) return "unknown time";
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return ts;
+  if (viewMode === "time") {
+    return new Intl.DateTimeFormat("en-IN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    }).format(date);
+  }
+  return date.toLocaleString("en-IN", { hour12: false });
+};
+
+const formatOperationReplayHumanLine = (event, timeViewMode = "timestamp") => {
+  const type = String(event?.type || "unknown_event");
+  const details = event?.details || {};
+  const at = formatOperationReplayTs(event?.timestamp, timeViewMode);
+
+  if (type === "system_start") {
+    return `[${at}] System started and Operation Replay logging is active.`;
+  }
+  if (type === "live_state_snapshot") {
+    const count = Number(details?.soldiers?.length || 0);
+    return `[${at}] Live battlefield snapshot captured (${count} soldiers).`;
+  }
+  if (type === "soldier_engage_update") {
+    return `[${at}] ${String(details?.id || "Soldier")} engagement status changed.`;
+  }
+  if (type === "soldier_fire_update") {
+    const firing = Boolean(details?.next?.firing);
+    return `[${at}] ${String(details?.id || "Soldier")} ${firing ? "started" : "stopped"} firing.`;
+  }
+  if (type === "watch_audio_event" || type === "audio_detect_firing") {
+    return `[${at}] Audio analysis completed for gunfire detection.`;
+  }
+  if (type === "watch_threat_assessment" || type === "bluetooth_threat_assessment") {
+    return `[${at}] Threat assessment generated from incoming battlefield audio.`;
+  }
+  if (type === "ws_client_connected") {
+    return `[${at}] A tactical screen connected to live stream.`;
+  }
+  if (type === "ws_client_disconnected") {
+    return `[${at}] A tactical screen disconnected from live stream.`;
+  }
+  if (type.endsWith("_error")) {
+    return `[${at}] An issue occurred while processing an operation event.`;
+  }
+  return `[${at}] ${type.replaceAll("_", " ")} recorded.`;
+};
+
 export default function App() {
   const [soldiers, setSoldiers] = useState([]);
   const [metrics, setMetrics] = useState(null);
+  const [squadIntelligence, setSquadIntelligence] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selectedSoldierId, setSelectedSoldierId] = useState("");
   const [lastRefreshAt, setLastRefreshAt] = useState("");
@@ -268,9 +365,30 @@ export default function App() {
   const [isStale, setIsStale] = useState(false);
   const [alertThresholds, setAlertThresholds] = useState(DEFAULT_ALERT_THRESHOLDS);
   const [isThresholdModalOpen, setIsThresholdModalOpen] = useState(false);
+  const [syncMode, setSyncMode] = useState(DEFAULT_SYNC_MODE);
+  const [wsStreamStatus, setWsStreamStatus] = useState("connecting");
+  const [tacticalPackets, setTacticalPackets] = useState({});
+  const [tacticalPaths, setTacticalPaths] = useState({});
+  const [operationReplayLogsView, setOperationReplayLogsView] = useState("show");
+  const [operationReplayTimeView, setOperationReplayTimeView] = useState("timestamp");
+  const [operationReplayMeta, setOperationReplayMeta] = useState({
+    files: [],
+    latestEvents: [],
+    selectedFile: "",
+    selectedCount: 0,
+    error: ""
+  });
   const audioContextRef = useRef(null);
   const alarmIntervalRef = useRef(null);
   const latestSnapshotRef = useRef("");
+  const lastSyncUiTimestampRef = useRef(0);
+  const selectedSyncConfig = useMemo(
+    () => SYNC_MODES[syncMode] ?? SYNC_MODES[DEFAULT_SYNC_MODE],
+    [syncMode]
+  );
+
+  const showPollingFallback =
+    !selectedSyncConfig.useLiveStream || streamStatus === "unsupported" || streamStatus === "disconnected";
 
   useEffect(() => {
     try {
@@ -301,47 +419,120 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+
+    const loadOperationReplay = async () => {
+      try {
+        const filesRes = await fetch(`${API_BASE}/operation-replay/log-files`, { cache: "no-store" });
+        const filesJson = await filesRes.json();
+        const files = Array.isArray(filesJson?.files) ? filesJson.files : [];
+        const preferredFile = operationReplayMeta.selectedFile || files[0]?.file || "";
+        let logsJson = { count: 0, events: [] };
+        if (preferredFile) {
+          const logsRes = await fetch(
+            `${API_BASE}/operation-replay/logs?file=${encodeURIComponent(preferredFile)}&limit=160`,
+            { cache: "no-store" }
+          );
+          logsJson = await logsRes.json();
+        }
+
+        if (!active) return;
+        setOperationReplayMeta({
+          files,
+          latestEvents: Array.isArray(logsJson?.events) ? logsJson.events : [],
+          selectedFile: preferredFile,
+          selectedCount: Number(logsJson?.count || 0),
+          error: ""
+        });
+      } catch (error) {
+        if (!active) return;
+        setOperationReplayMeta((prev) => ({
+          ...prev,
+          error: error instanceof Error ? error.message : "Unable to load Operation Replay logs"
+        }));
+      }
+    };
+
+    loadOperationReplay();
+    const interval = window.setInterval(loadOperationReplay, 10_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [operationReplayMeta.selectedFile]);
+
+  useEffect(() => {
     localStorage.setItem(THRESHOLD_STORAGE_KEY, JSON.stringify(alertThresholds));
   }, [alertThresholds]);
 
-  const applyIncomingData = useCallback((incomingSoldiersRaw, metricJson, timestamp = "") => {
+  useEffect(() => {
+    try {
+      const persistedMode = localStorage.getItem(SYNC_MODE_STORAGE_KEY);
+      if (persistedMode && SYNC_MODES[persistedMode]) {
+        setSyncMode(persistedMode);
+      }
+    } catch (_error) {
+      // ignore malformed local data
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(SYNC_MODE_STORAGE_KEY, syncMode);
+  }, [syncMode]);
+
+  const applyIncomingData = useCallback((incomingSoldiersRaw, metricJson, squadIntelJson, timestamp = "") => {
     const incomingSoldiers = normalizeSoldiers(incomingSoldiersRaw);
+    const nextSyncAt = timestamp || new Date().toISOString();
+    const nextSyncMs = new Date(nextSyncAt).getTime() || Date.now();
 
     const nextSnapshot = JSON.stringify({
       incomingSoldiers,
-      metricJson
+      metricJson,
+      squadIntelJson: normalizeSquadIntelForDiff(squadIntelJson)
     });
 
     if (nextSnapshot !== latestSnapshotRef.current) {
       latestSnapshotRef.current = nextSnapshot;
       setSoldiers(incomingSoldiers);
       setMetrics(metricJson);
-      setLastRefreshAt(timestamp || new Date().toISOString());
+      setSquadIntelligence(squadIntelJson);
+      setLastRefreshAt(nextSyncAt);
+      lastSyncUiTimestampRef.current = nextSyncMs;
       setLiveUpdateCount((prev) => prev + 1);
       setSelectedSoldierId((prev) =>
         incomingSoldiers.some((soldier) => soldier.id === prev) ? prev : ""
       );
+      return;
+    }
+
+    // Keep stale detection accurate without forcing full map repaint every second.
+    if (!lastSyncUiTimestampRef.current || nextSyncMs - lastSyncUiTimestampRef.current >= 5000) {
+      setLastRefreshAt(nextSyncAt);
+      lastSyncUiTimestampRef.current = nextSyncMs;
     }
   }, []);
 
-  useEffect(() => {
-    let active = true;
-
+  const loadSnapshot = useCallback(async () => {
     const fetchJson = async (url) => {
       const response = await fetch(url, { cache: "no-store" });
       return response.json();
     };
 
+    const [soldierJson, metricJson, squadIntelJson] = await Promise.all([
+      fetchJson(`${API_BASE}/soldiers/raw`),
+      fetchJson(`${API_BASE}/metrics`),
+      fetchJson(`${API_BASE}/intelligence/squad`)
+    ]);
+
+    applyIncomingData(soldierJson.data || [], metricJson, squadIntelJson);
+  }, [applyIncomingData]);
+
+  useEffect(() => {
+    let active = true;
+
     const load = async () => {
       try {
-        const [soldierJson, metricJson] = await Promise.all([
-          fetchJson(`${API_BASE}/soldiers/raw`),
-          fetchJson(`${API_BASE}/metrics`)
-        ]);
-
-        if (!active) return;
-
-        applyIncomingData(soldierJson.data || [], metricJson);
+        await loadSnapshot();
       } finally {
         if (active) {
           setLoading(false);
@@ -352,21 +543,36 @@ export default function App() {
     load();
 
     const onVisible = () => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState === "visible" && showPollingFallback) {
         load();
       }
     };
 
-    const interval = setInterval(load, POLL_INTERVAL_MS);
+    if (!showPollingFallback) {
+      setLoading(false);
+      document.addEventListener("visibilitychange", onVisible);
+      return () => {
+        active = false;
+        document.removeEventListener("visibilitychange", onVisible);
+      };
+    }
+
+    load();
+    const interval = setInterval(load, selectedSyncConfig.pollIntervalMs);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       active = false;
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [applyIncomingData]);
+  }, [loadSnapshot, selectedSyncConfig.pollIntervalMs, showPollingFallback]);
 
   useEffect(() => {
+    if (!selectedSyncConfig.useLiveStream) {
+      setStreamStatus("standby");
+      return;
+    }
+
     if (typeof window === "undefined" || typeof EventSource === "undefined") {
       setStreamStatus("unsupported");
       return;
@@ -391,7 +597,12 @@ export default function App() {
       source.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
-          applyIncomingData(payload.soldiers || [], payload.metrics || null, payload.timestamp || "");
+          applyIncomingData(
+            payload.soldiers || [],
+            payload.metrics || null,
+            payload.squadIntelligence || null,
+            payload.timestamp || ""
+          );
           setLoading(false);
         } catch (_error) {
           // Ignore malformed stream packet.
@@ -416,7 +627,134 @@ export default function App() {
       if (source) source.close();
       if (retryTimer) window.clearTimeout(retryTimer);
     };
-  }, [applyIncomingData]);
+  }, [applyIncomingData, selectedSyncConfig.useLiveStream]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof WebSocket === "undefined") {
+      setWsStreamStatus("unsupported");
+      return;
+    }
+
+    let socket;
+    let retryTimer;
+    let retryCount = 0;
+    let closed = false;
+
+    const wsUrl = (() => {
+      const parsed = new URL(API_BASE);
+      const protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+      return `${protocol}//${parsed.host}/ws`;
+    })();
+
+    const connect = () => {
+      if (closed) return;
+
+      setWsStreamStatus(retryCount === 0 ? "connecting" : "reconnecting");
+      socket = new WebSocket(wsUrl);
+
+      socket.onopen = () => {
+        retryCount = 0;
+        setWsStreamStatus("connected");
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const packet = JSON.parse(event.data);
+          const soldierId = String(packet?.soldier_id || "");
+          if (!soldierId) return;
+          const x = Number(packet?.position?.x);
+          const y = Number(packet?.position?.y);
+          const lat = Number(packet?.latlng?.lat);
+          const lng = Number(packet?.latlng?.lng);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
+          setTacticalPackets((prev) => {
+            const previous = prev[soldierId];
+            const prevX = Number(previous?.position?.x);
+            const prevY = Number(previous?.position?.y);
+            const prevBearing = Number(previous?.gunfire_dir);
+            const nextBearing = Number(packet?.gunfire_dir);
+            const prevLat = Number(previous?.latlng?.lat);
+            const prevLng = Number(previous?.latlng?.lng);
+
+            const unchanged =
+              Number.isFinite(prevX) &&
+              Number.isFinite(prevY) &&
+              Math.abs(prevX - x) < 0.001 &&
+              Math.abs(prevY - y) < 0.001 &&
+              String(previous?.activity || "") === String(packet?.activity || "") &&
+              String(previous?.health || "") === String(packet?.health || "") &&
+              ((Number.isFinite(prevBearing) && Number.isFinite(nextBearing) && Math.abs(prevBearing - nextBearing) < 0.001) ||
+                (!Number.isFinite(prevBearing) && !Number.isFinite(nextBearing))) &&
+              ((Number.isFinite(prevLat) && Number.isFinite(lat) && Math.abs(prevLat - lat) < 0.000001) ||
+                (!Number.isFinite(prevLat) && !Number.isFinite(lat))) &&
+              ((Number.isFinite(prevLng) && Number.isFinite(lng) && Math.abs(prevLng - lng) < 0.000001) ||
+                (!Number.isFinite(prevLng) && !Number.isFinite(lng)));
+
+            if (unchanged) return prev;
+            return {
+              ...prev,
+              [soldierId]: packet
+            };
+          });
+
+          setTacticalPaths((prev) => {
+            const existing = prev[soldierId] || [];
+            const lastPoint = existing[existing.length - 1];
+            if (lastPoint) {
+              const sameXY = Math.abs(Number(lastPoint.x) - x) < 0.25 && Math.abs(Number(lastPoint.y) - y) < 0.25;
+              const sameLatLng =
+                ((Number.isFinite(Number(lastPoint.lat)) && Number.isFinite(lat) && Math.abs(Number(lastPoint.lat) - lat) < 0.000002) ||
+                  (!Number.isFinite(Number(lastPoint.lat)) && !Number.isFinite(lat))) &&
+                ((Number.isFinite(Number(lastPoint.lng)) && Number.isFinite(lng) && Math.abs(Number(lastPoint.lng) - lng) < 0.000002) ||
+                  (!Number.isFinite(Number(lastPoint.lng)) && !Number.isFinite(lng)));
+              if (sameXY && sameLatLng) {
+                return prev;
+              }
+            }
+
+            const nextPath = [
+              ...existing,
+              {
+                x,
+                y,
+                lat: Number.isFinite(lat) ? lat : null,
+                lng: Number.isFinite(lng) ? lng : null,
+                timestamp: packet?.timestamp || Date.now()
+              }
+            ];
+            if (nextPath.length > 40) {
+              nextPath.splice(0, nextPath.length - 40);
+            }
+            return {
+              ...prev,
+              [soldierId]: nextPath
+            };
+          });
+        } catch (_error) {
+          // Ignore malformed websocket packet.
+        }
+      };
+
+      socket.onclose = () => {
+        if (closed) return;
+        setWsStreamStatus("disconnected");
+        const delay = Math.min(10_000, 1000 * 2 ** retryCount);
+        retryCount += 1;
+        retryTimer = window.setTimeout(connect, delay);
+      };
+    };
+
+    connect();
+
+    return () => {
+      closed = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const checkStale = () => {
@@ -426,13 +764,13 @@ export default function App() {
       }
 
       const ageMs = Date.now() - new Date(lastRefreshAt).getTime();
-      setIsStale(ageMs > STALE_AFTER_MS);
+      setIsStale(ageMs > selectedSyncConfig.staleAfterMs);
     };
 
     checkStale();
     const interval = window.setInterval(checkStale, 1000);
     return () => window.clearInterval(interval);
-  }, [lastRefreshAt]);
+  }, [lastRefreshAt, selectedSyncConfig.staleAfterMs]);
 
   const soldierCount = soldiers.length;
 
@@ -636,28 +974,198 @@ export default function App() {
 
   const mapCenter = useMemo(() => {
     if (!soldiers.length) return [28.6139, 77.209];
-
     const aggregate = soldiers.reduce(
-      (acc, soldier) => {
-        return {
-          lat: acc.lat + soldier.coordinates.lat,
-          lng: acc.lng + soldier.coordinates.lng
-        };
-      },
+      (acc, soldier) => ({
+        lat: acc.lat + soldier.coordinates.lat,
+        lng: acc.lng + soldier.coordinates.lng
+      }),
       { lat: 0, lng: 0 }
     );
-
     return [aggregate.lat / soldiers.length, aggregate.lng / soldiers.length];
   }, [soldiers]);
+
+  const sectorOverlays = useMemo(() => {
+    const grouped = new Map();
+    soldiers.forEach((soldier) => {
+      const key = soldier.map || "Unknown";
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          name: key,
+          count: 0,
+          latSum: 0,
+          lngSum: 0
+        });
+      }
+      const row = grouped.get(key);
+      row.count += 1;
+      row.latSum += soldier.coordinates.lat;
+      row.lngSum += soldier.coordinates.lng;
+    });
+
+    return [...grouped.values()].map((row, index) => ({
+      ...row,
+      lat: row.latSum / Math.max(1, row.count),
+      lng: row.lngSum / Math.max(1, row.count),
+      terrainRadius: 130 + index * 25,
+      mountainRadius: 55 + index * 15,
+      forestRadius: 85 + index * 18
+    }));
+  }, [soldiers]);
+
+  const directionVectors = useMemo(() => {
+    return soldiers
+      .map((soldier) => {
+        const packet = tacticalPackets[soldier.id];
+        const bearing = Number(packet?.gunfire_dir);
+        const headingDeg = Number.isFinite(bearing) ? bearing : getDummyBearing(soldier.id);
+        const start = [soldier.coordinates.lat, soldier.coordinates.lng];
+        const end = projectByDistance({
+          lat: soldier.coordinates.lat,
+          lng: soldier.coordinates.lng,
+          bearingDeg: headingDeg,
+          meters: soldier.firing ? 80 : 45
+        });
+        return {
+          id: soldier.id,
+          firing: soldier.firing,
+          bearingDeg: headingDeg,
+          points: [start, end],
+          arrowAt: end
+        };
+      })
+      .filter(Boolean);
+  }, [soldiers, tacticalPackets]);
+
+  const gunfireDetections = useMemo(() => {
+    return directionVectors
+      .filter((vector) => vector.firing)
+      .map((vector) => {
+        const [originLat, originLng] = vector.points[0];
+        const leftEdge = projectByDistance({
+          lat: originLat,
+          lng: originLng,
+          bearingDeg: vector.bearingDeg - 22,
+          meters: 95
+        });
+        const rightEdge = projectByDistance({
+          lat: originLat,
+          lng: originLng,
+          bearingDeg: vector.bearingDeg + 22,
+          meters: 95
+        });
+
+        return {
+          id: vector.id,
+          origin: [originLat, originLng],
+          cone: [[originLat, originLng], leftEdge, rightEdge],
+          innerRadius: 26,
+          outerRadius: 58
+        };
+      });
+  }, [directionVectors]);
+
+  const operationReplayFormatSample = useMemo(() => {
+    const sample = operationReplayMeta.latestEvents[0];
+    if (!sample) return null;
+    return {
+      seq: sample.seq,
+      timestamp: sample.timestamp,
+      ts: sample.ts,
+      type: sample.type,
+      details: sample.details
+    };
+  }, [operationReplayMeta.latestEvents]);
+
+  const operationReplayReadableTimeline = useMemo(() => {
+    return operationReplayMeta.latestEvents
+      .slice(-25)
+      .reverse()
+      .map((event) => ({
+        key: `${String(event.seq)}-${String(event.type)}`,
+        text: formatOperationReplayHumanLine(event, operationReplayTimeView)
+      }));
+  }, [operationReplayMeta.latestEvents, operationReplayTimeView]);
+
+  const squadPatternCards = useMemo(() => {
+    if (!squadIntelligence) return [];
+    const patterns = squadIntelligence.patterns || {};
+    return [
+      {
+        key: "ambush",
+        label: "Ambush Detection",
+        detected: Boolean(patterns?.ambushDetection?.detected),
+        facts: [
+          `Gunfire: ${patterns?.ambushDetection?.gunfireDetected ? "Yes" : "No"}`,
+          `Sudden Stops: ${Number(patterns?.ambushDetection?.suddenStops || 0)}`
+        ]
+      },
+      {
+        key: "split",
+        label: "Squad Split",
+        detected: Boolean(patterns?.squadSplit?.detected),
+        facts: [
+          `Max Distance: ${Number(patterns?.squadSplit?.maxDistanceMeters || 0)}m`,
+          `Threshold: ${Number(patterns?.squadSplit?.thresholdMeters || 0)}m`
+        ]
+      },
+      {
+        key: "movement",
+        label: "Coordinated Movement",
+        detected: Boolean(patterns?.coordinatedMovement?.detected),
+        facts: [
+          `Parallel Score: ${Number(patterns?.coordinatedMovement?.parallelScore || 0)}`,
+          `Moving Units: ${Number(patterns?.coordinatedMovement?.movingSoldiers || 0)}`
+        ]
+      },
+      {
+        key: "isolation",
+        label: "Soldier Isolation",
+        detected: Boolean(patterns?.soldierIsolation?.detected),
+        facts: [
+          `Isolated: ${Number(patterns?.soldierIsolation?.isolatedCount || 0)}`,
+          `Threshold: ${Number(patterns?.soldierIsolation?.thresholdMeters || 80)}m`
+        ]
+      }
+    ];
+  }, [squadIntelligence]);
+
+  const squadAlertRows = useMemo(() => {
+    if (!Array.isArray(squadIntelligence?.alerts)) return [];
+    return squadIntelligence.alerts.map((alert, index) => ({
+      key: `${String(alert.type)}-${index}`,
+      title: String(alert.title || "Alert"),
+      message: String(alert.message || ""),
+      severity: String(alert.severity || "info").toLowerCase()
+    }));
+  }, [squadIntelligence]);
 
   return (
     <main className="page">
       <header className="topbar">
-        <h1>War Room Tactical Dashboard</h1>
+        <div className="topbar-title-row">
+          <h1>War Room Tactical Dashboard</h1>
+          <label className="sync-mode-control">
+            <span>Sync Mode</span>
+            <select
+              value={syncMode}
+              onChange={(event) => setSyncMode(event.target.value)}
+              aria-label="Select network intelligence mode"
+            >
+              {Object.entries(SYNC_MODES).map(([mode, config]) => (
+                <option key={mode} value={mode}>
+                  {config.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <p>Raw telemetry feed with floor-aware map markers and combat state.</p>
+        <small className="sync-text">
+          Mode: {selectedSyncConfig.label.toUpperCase()} ({selectedSyncConfig.description})
+        </small>
         <small className="sync-text">Latest feed sync: {formattedLastSync}</small>
         <small className="sync-text sync-text-secondary">
-          Live feed: {streamStatus.toUpperCase()} | Poll fallback: {POLL_INTERVAL_MS / 1000}s | Changes applied: {liveUpdateCount}
+          Live feed: {streamStatus.toUpperCase()} | Poll fallback: {showPollingFallback ? `${selectedSyncConfig.pollIntervalMs / 1000}s` : "disabled"} | Changes applied: {liveUpdateCount}
         </small>
       </header>
 
@@ -665,7 +1173,7 @@ export default function App() {
         <section className="alarm-banner alarm-stale">
           <div>
             <strong>DATA STALE</strong>
-            <span>No new telemetry for more than {STALE_AFTER_MS / 1000}s. Check watch uplink/network.</span>
+            <span>No new telemetry for more than {selectedSyncConfig.staleAfterMs / 1000}s. Check watch uplink/network.</span>
           </div>
         </section>
       ) : null}
@@ -796,19 +1304,112 @@ export default function App() {
 
       <section className="grid">
         <article className="panel wide map-panel">
-          <h2>Map View</h2>
+          <h2>2D Tactical Map</h2>
+          <p className="three-status">
+            WebSocket Stream: {wsStreamStatus.toUpperCase()} | Packets tracked: {Object.keys(tacticalPackets).length}
+          </p>
           <div className="map-box osm-map-box">
-            <MapContainer
-              center={mapCenter}
-              zoom={17}
-              scrollWheelZoom
-              className="osm-map"
-            >
+            <MapContainer center={mapCenter} zoom={16} scrollWheelZoom className="osm-map" maxZoom={22}>
               <TileLayer
-                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                attribution='&copy; OpenStreetMap contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                maxZoom={22}
+                maxNativeZoom={19}
               />
               <MapActionButtons soldiers={soldiers} selectedSoldier={selectedSoldier} />
+
+              {sectorOverlays.map((sector, index) => (
+                <Circle
+                  key={`${sector.name}-forest-${index}`}
+                  center={[sector.lat + 0.00032, sector.lng - 0.00025]}
+                  radius={sector.forestRadius}
+                  pathOptions={{ color: "#3e8d4f", fillColor: "#4fa866", fillOpacity: 0.15, dashArray: "4 6", weight: 1.2 }}
+                />
+              ))}
+
+              {sectorOverlays.map((sector, index) => (
+                <Polygon
+                  key={`${sector.name}-mountain-${index}`}
+                  positions={[
+                    [sector.lat - 0.00025, sector.lng + 0.0002],
+                    [sector.lat + 0.0001, sector.lng + 0.00055],
+                    [sector.lat + 0.00035, sector.lng + 0.00015]
+                  ]}
+                  pathOptions={{ color: "#9b7d5b", fillColor: "#b39874", fillOpacity: 0.2, weight: 1.2 }}
+                />
+              ))}
+
+              {Object.entries(tacticalPaths).map(([soldierId, pathPoints]) => {
+                const points = pathPoints
+                  .map((point) =>
+                    Number.isFinite(point.lat) && Number.isFinite(point.lng) ? [point.lat, point.lng] : null
+                  )
+                  .filter(Boolean);
+                if (points.length < 2) return null;
+                return (
+                  <Polyline
+                    key={`path-${soldierId}`}
+                    positions={points}
+                    pathOptions={{ color: "#5fd1ff", weight: 2.2, opacity: 0.72 }}
+                  />
+                );
+              })}
+
+              {directionVectors.map((vector) => (
+                <Polyline
+                  key={`dir-line-${vector.id}`}
+                  positions={vector.points}
+                  pathOptions={{
+                    color: vector.firing ? "#ff8a6f" : "#f5cc72",
+                    weight: vector.firing ? 1.8 : 1.6,
+                    opacity: vector.firing ? 0.48 : 0.42
+                  }}
+                />
+              ))}
+
+              {directionVectors.map((vector) => (
+                <Marker
+                  key={`dir-arrow-${vector.id}`}
+                  position={vector.arrowAt}
+                  icon={directionArrowIcon({ bearingDeg: vector.bearingDeg, active: vector.firing })}
+                  interactive={false}
+                />
+              ))}
+
+              {gunfireDetections.map((gunfire) => (
+                <Circle
+                  key={`gunfire-core-${gunfire.id}`}
+                  center={gunfire.origin}
+                  radius={gunfire.innerRadius * 0.75}
+                  pathOptions={{ color: "#ff4a3c", fillColor: "#ff4a3c", fillOpacity: 0.34, weight: 0.6, opacity: 0.38 }}
+                />
+              ))}
+
+              {gunfireDetections.map((gunfire) => (
+                <Circle
+                  key={`gunfire-mid-${gunfire.id}`}
+                  center={gunfire.origin}
+                  radius={gunfire.outerRadius * 0.78}
+                  pathOptions={{ color: "#ff7a62", fillColor: "#ff7a62", fillOpacity: 0.2, weight: 0.5, opacity: 0.3 }}
+                />
+              ))}
+
+              {gunfireDetections.map((gunfire) => (
+                <Circle
+                  key={`gunfire-falloff-${gunfire.id}`}
+                  center={gunfire.origin}
+                  radius={gunfire.outerRadius * 1.15}
+                  pathOptions={{ color: "#ff9d81", fillColor: "#ff9d81", fillOpacity: 0.11, weight: 0.4, opacity: 0.2 }}
+                />
+              ))}
+
+              {gunfireDetections.map((gunfire) => (
+                <Polygon
+                  key={`gunfire-cone-${gunfire.id}`}
+                  positions={gunfire.cone}
+                  pathOptions={{ color: "#ff8a6f", fillColor: "#ff8a6f", fillOpacity: 0.09, weight: 0.3, opacity: 0.22 }}
+                />
+              ))}
 
               {soldiers.map((soldier) => (
                 <Marker
@@ -820,7 +1421,7 @@ export default function App() {
                   }}
                 >
                   <Tooltip direction="top" offset={[0, -10]} opacity={0.9}>
-                    {soldier.id} | F{soldier.floor}
+                    {soldier.id} | F{soldier.floor} | {soldier.map}
                   </Tooltip>
                 </Marker>
               ))}
@@ -829,6 +1430,11 @@ export default function App() {
           <div className="legend">
             <span><i className="dot-icon" />Floor 0 = Dot</span>
             <span><i className="triangle-icon" />Floor &gt; 0 = Triangle</span>
+            <span><i className="legend-color" style={{ backgroundColor: "#5fd1ff" }} />Squad Path</span>
+            <span><i className="legend-color" style={{ backgroundColor: "#ff5a4b" }} />Direction / Fire Vector</span>
+            <span><i className="legend-color" style={{ backgroundColor: "#ff8e72" }} />Gunfire Detection Zone</span>
+            <span><i className="legend-color" style={{ backgroundColor: "#4fa866" }} />Forest Zone</span>
+            <span><i className="legend-color" style={{ backgroundColor: "#b39874" }} />Mountain Zone</span>
             <span><i className="legend-color status-yellow" />Injured</span>
             <span><i className="legend-color status-white" />Dead</span>
             <span><i className="legend-color status-green" />Healthy</span>
@@ -856,7 +1462,7 @@ export default function App() {
               <div className="detail-row"><span>Fire</span><strong>{selectedSoldier.firing ? "YES" : "NO"}</strong></div>
             </div>
           ) : (
-            <p>Select a soldier marker on map to view latest updates.</p>
+            <p>Select a soldier marker on the 2D map to view latest updates.</p>
           )}
         </article>
 
@@ -870,6 +1476,207 @@ export default function App() {
               </div>
             ))}
           </div>
+        </article>
+
+        <article className="panel wide">
+          <h2>Squad-Level Data Intelligence</h2>
+          {squadIntelligence ? (
+            <div className="squad-war-intel">
+              <div className="squad-war-strip">
+                <div className="squad-war-kpi">
+                  <span>Algorithm</span>
+                  <strong>{String(squadIntelligence.algorithm || "rule_based+statistical")}</strong>
+                </div>
+                <div className="squad-war-kpi">
+                  <span>Alive Units</span>
+                  <strong>{Number(squadIntelligence.stats?.aliveUnits || 0)}</strong>
+                </div>
+                <div className="squad-war-kpi">
+                  <span>Avg Speed</span>
+                  <strong>{Number(squadIntelligence.stats?.avgSpeedMps || 0)} m/s</strong>
+                </div>
+                <div className="squad-war-kpi">
+                  <span>Active Alerts</span>
+                  <strong>{squadAlertRows.length}</strong>
+                </div>
+              </div>
+
+              <div className="squad-war-pattern-grid">
+                {squadPatternCards.map((pattern) => (
+                  <div
+                    key={pattern.key}
+                    className={`squad-war-pattern ${pattern.detected ? "pattern-detected" : "pattern-clear"}`}
+                  >
+                    <div className="squad-war-pattern-head">
+                      <strong>{pattern.label}</strong>
+                      <span>{pattern.detected ? "DETECTED" : "CLEAR"}</span>
+                    </div>
+                    <div className="squad-war-facts">
+                      {pattern.facts.map((fact) => (
+                        <p key={`${pattern.key}-${fact}`}>{fact}</p>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {squadAlertRows.length > 0 ? (
+                <div className="squad-war-alert-board">
+                  <h3>Alert Board</h3>
+                  <div className="squad-war-alerts">
+                    {squadAlertRows.map((alert) => (
+                      <div key={alert.key} className={`squad-war-alert severity-${alert.severity}`}>
+                        <strong>{alert.title}</strong>
+                        <span>{alert.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="squad-war-clear">
+                  <strong>Alert Board</strong>
+                  <span>No squad-level alerts right now.</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <p>Squad intelligence feed pending...</p>
+          )}
+        </article>
+
+        <article className="panel wide">
+          <div className="threshold-head">
+            <h2>Operation Replay</h2>
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+              <label className="sync-mode-control" style={{ minWidth: "180px" }}>
+                <span>Logs Visibility</span>
+                <select
+                  value={operationReplayLogsView}
+                  onChange={(event) => setOperationReplayLogsView(event.target.value)}
+                  aria-label="Operation replay logs visibility"
+                >
+                  <option value="show">Show Logs</option>
+                  <option value="hide">Hide Logs</option>
+                </select>
+              </label>
+              <label className="sync-mode-control" style={{ minWidth: "180px" }}>
+                <span>Timestamp View</span>
+                <select
+                  value={operationReplayTimeView}
+                  onChange={(event) => setOperationReplayTimeView(event.target.value)}
+                  aria-label="Operation replay timestamp view"
+                >
+                  <option value="timestamp">Timestamp</option>
+                  <option value="time">Time Only</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <div className="stats">
+            <div className="stat">
+              <span>Replay Files</span>
+              <strong>{operationReplayMeta.files.length}</strong>
+            </div>
+            <div className="stat">
+              <span>Loaded Events</span>
+              <strong>{operationReplayMeta.latestEvents.length}</strong>
+            </div>
+            <div className="stat">
+              <span>Total Events (File)</span>
+              <strong>{operationReplayMeta.selectedCount}</strong>
+            </div>
+          </div>
+          {operationReplayMeta.error ? <p className="sync-text">{operationReplayMeta.error}</p> : null}
+          {operationReplayLogsView === "show" && operationReplayMeta.files.length > 0 ? (
+            <div className="table-wrap" style={{ marginTop: "10px" }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Log File</th>
+                    <th>Updated</th>
+                    <th>Size (bytes)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {operationReplayMeta.files.slice(0, 6).map((file) => (
+                    <tr
+                      key={String(file.file)}
+                      className={operationReplayMeta.selectedFile === String(file.file) ? "row-selected" : ""}
+                      onClick={() =>
+                        setOperationReplayMeta((prev) => ({
+                          ...prev,
+                          selectedFile: String(file.file)
+                        }))
+                      }
+                    >
+                      <td>{String(file.file)}</td>
+                      <td>{formatOperationReplayTs(file.updatedAt, operationReplayTimeView)}</td>
+                      <td>{Number(file.bytes || 0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : operationReplayLogsView === "show" ? (
+            <p className="sync-text">No Operation Replay log files yet.</p>
+          ) : (
+            <p className="sync-text">Operation logs are hidden by dropdown selection.</p>
+          )}
+          {operationReplayLogsView === "show" && operationReplayMeta.selectedFile ? (
+            <p className="sync-text">Selected file: {operationReplayMeta.selectedFile} (click another file to switch)</p>
+          ) : null}
+          {operationReplayLogsView === "show" && operationReplayMeta.latestEvents.length > 0 ? (
+            <>
+              <div className="panel" style={{ marginTop: "10px", padding: "12px" }}>
+                <h3 className="operation-replay-heading">Operation Replay - Readable Timeline</h3>
+                <div className="operation-replay-readable-list">
+                  {operationReplayReadableTimeline.map((item) => (
+                    <div key={item.key} className="operation-replay-readable-item">
+                      {item.text}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="table-wrap" style={{ marginTop: "10px" }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Seq</th>
+                      <th>{operationReplayTimeView === "time" ? "Time" : "Timestamp"}</th>
+                      <th>Type</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {operationReplayMeta.latestEvents.slice(-20).map((event) => (
+                      <tr key={`${String(event.seq)}-${String(event.type)}`}>
+                        <td>{Number(event.seq || 0)}</td>
+                        <td>{formatOperationReplayTs(event.timestamp, operationReplayTimeView)}</td>
+                        <td>{String(event.type || "-")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="table-wrap" style={{ marginTop: "10px" }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Operation Replay Event Format (JSONL)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>
+                        <pre className="operation-replay-json">
+{JSON.stringify(operationReplayFormatSample, null, 2)}
+                        </pre>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
         </article>
 
         <article className="panel wide">
