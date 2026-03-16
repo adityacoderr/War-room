@@ -7,3 +7,5 @@ client/dist/
 tmp/
 __pycache__/
 *.pyc
+server/.env
+server/logs/

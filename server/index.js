@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
 import cors from "cors";
@@ -5,6 +6,7 @@ import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { MongoClient } from "mongodb";
 import { inferFiringFromAudio, inferFiringWithDiagnostics } from "./audioInference.js";
 
 const app = express();
@@ -13,17 +15,66 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const KNOWN_GUN_TYPES = new Set(["ak47", "m16", "glock", "pistol", "shotgun", "sniper", "smg", "lmg", "hmg"]);
 const BLUETOOTH_RAW_TYPES = ["audio/wav", "audio/x-wav", "application/octet-stream"];
+const HUMAN_ACTIVITY_LABELS = new Set(["standing", "walking", "running", "crawling", "idle"]);
 const streamStates = new Map();
 const REPLAY_LOG_DIR = path.join(__dirname, "logs");
 const REPLAY_LOG_MAX_BYTES = Number(process.env.REPLAY_LOG_MAX_BYTES ?? 50 * 1024 * 1024);
 const REPLAY_DEFAULT_LIMIT = 500;
 const OPERATION_REPLAY_WRITE_ENABLED = String(process.env.OPERATION_REPLAY_WRITE_ENABLED ?? "false") === "true";
+const MONGODB_URI = String(process.env.MONGODB_URI ?? process.env.MONGO_URI ?? "").trim();
+const MONGODB_DB = String(process.env.MONGODB_DB ?? "war_room").trim();
+const MONGODB_ENABLED = MONGODB_URI.length > 0;
+const MONGO_REPLAY_FILE_NAME = "operation-replay-mongodb";
 
 let replaySequence = 0;
 let replayLogFilePath = "";
+let mongoClient = null;
+let mongoDb = null;
+let mongoCollections = {
+  soldiers: null,
+  imuEvents: null,
+  replayEvents: null
+};
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+
+const isMongoReady = () => Boolean(mongoDb && mongoCollections.soldiers && mongoCollections.replayEvents);
+
+const initializeMongo = async () => {
+  if (!MONGODB_ENABLED) {
+    console.log("[mongo] disabled (set MONGODB_URI to enable persistent storage)");
+    return false;
+  }
+
+  try {
+    mongoClient = new MongoClient(MONGODB_URI, { maxPoolSize: 15 });
+    await mongoClient.connect();
+    mongoDb = mongoClient.db(MONGODB_DB);
+    mongoCollections = {
+      soldiers: mongoDb.collection("soldiers"),
+      imuEvents: mongoDb.collection("imu_events"),
+      replayEvents: mongoDb.collection("operation_replay_events")
+    };
+
+    await Promise.all([
+      mongoCollections.soldiers.createIndex({ id: 1 }, { unique: true }),
+      mongoCollections.imuEvents.createIndex({ soldierId: 1, ts: -1 }),
+      mongoCollections.replayEvents.createIndex({ seq: 1 }, { unique: true }),
+      mongoCollections.replayEvents.createIndex({ timestamp: -1 }),
+      mongoCollections.replayEvents.createIndex({ type: 1, timestamp: -1 })
+    ]);
+
+    console.log(`[mongo] connected to db "${MONGODB_DB}"`);
+    return true;
+  } catch (error) {
+    console.error("[mongo] connection failed:", error instanceof Error ? error.message : error);
+    mongoClient = null;
+    mongoDb = null;
+    mongoCollections = { soldiers: null, imuEvents: null, replayEvents: null };
+    return false;
+  }
+};
 
 const ensureReplayLogFile = () => {
   fs.mkdirSync(REPLAY_LOG_DIR, { recursive: true });
@@ -103,26 +154,44 @@ const summarizePayloadForReplay = (value) => {
 };
 
 const appendReplayEvent = (type, details = {}) => {
-  if (!OPERATION_REPLAY_WRITE_ENABLED) {
-    return;
+  const now = new Date();
+  const event = {
+    seq: ++replaySequence,
+    timestamp: now.toISOString(),
+    ts: now.getTime(),
+    type,
+    details: summarizePayloadForReplay(details)
+  };
+
+  if (OPERATION_REPLAY_WRITE_ENABLED) {
+    try {
+      const filePath = rotateReplayLogIfNeeded();
+      fs.appendFileSync(filePath, `${JSON.stringify(event)}\n`, "utf-8");
+    } catch (error) {
+      console.error("[replay-log] failed to append event:", error instanceof Error ? error.message : error);
+    }
   }
-  try {
-    const filePath = rotateReplayLogIfNeeded();
-    const now = new Date();
-    const event = {
-      seq: ++replaySequence,
-      timestamp: now.toISOString(),
-      ts: now.getTime(),
-      type,
-      details: summarizePayloadForReplay(details)
-    };
-    fs.appendFileSync(filePath, `${JSON.stringify(event)}\n`, "utf-8");
-  } catch (error) {
-    console.error("[replay-log] failed to append event:", error instanceof Error ? error.message : error);
+
+  if (isMongoReady()) {
+    mongoCollections.replayEvents.insertOne(event).catch((error) => {
+      console.error("[mongo] replay insert failed:", error instanceof Error ? error.message : error);
+    });
   }
 };
 
-const listReplayLogFiles = () => {
+const listReplayLogFiles = async () => {
+  if (isMongoReady()) {
+    const [count, latestEvent] = await Promise.all([
+      mongoCollections.replayEvents.countDocuments({}),
+      mongoCollections.replayEvents.find({}).sort({ ts: -1 }).limit(1).next()
+    ]);
+    return [{
+      file: MONGO_REPLAY_FILE_NAME,
+      bytes: count,
+      updatedAt: latestEvent?.timestamp ?? new Date().toISOString()
+    }];
+  }
+
   fs.mkdirSync(REPLAY_LOG_DIR, { recursive: true });
   return fs
     .readdirSync(REPLAY_LOG_DIR)
@@ -139,10 +208,26 @@ const listReplayLogFiles = () => {
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
 };
 
-const loadReplayEvents = ({ file, type, limit }) => {
-  const selectedFile = file
-    ? path.basename(file)
-    : path.basename(ensureReplayLogFile());
+const loadReplayEvents = async ({ file, type, limit }) => {
+  const selectedFile = file ? path.basename(file) : (isMongoReady() ? MONGO_REPLAY_FILE_NAME : path.basename(ensureReplayLogFile()));
+  const cap = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(10_000, Number(limit))) : REPLAY_DEFAULT_LIMIT;
+
+  if (isMongoReady() && selectedFile === MONGO_REPLAY_FILE_NAME) {
+    const filter = type ? { type: String(type) } : {};
+    const [count, docs] = await Promise.all([
+      mongoCollections.replayEvents.countDocuments(filter),
+      mongoCollections.replayEvents.find(filter).sort({ seq: -1 }).limit(cap).toArray()
+    ]);
+    return {
+      file: selectedFile,
+      count,
+      events: docs.reverse().map((doc) => {
+        const { _id, ...rest } = doc;
+        return rest;
+      })
+    };
+  }
+
   const filePath = path.join(REPLAY_LOG_DIR, selectedFile);
   if (!fs.existsSync(filePath)) {
     return { file: selectedFile, count: 0, events: [] };
@@ -161,12 +246,39 @@ const loadReplayEvents = ({ file, type, limit }) => {
     .filter(Boolean);
 
   const filtered = type ? parsed.filter((event) => String(event.type) === String(type)) : parsed;
-  const cap = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(10_000, Number(limit))) : REPLAY_DEFAULT_LIMIT;
   return {
     file: selectedFile,
     count: filtered.length,
     events: filtered.slice(-cap)
   };
+};
+
+const bootstrapReplaySequenceFromFile = () => {
+  try {
+    const filePath = ensureReplayLogFile();
+    if (!fs.existsSync(filePath)) return 0;
+    const raw = fs.readFileSync(filePath, "utf-8").trim();
+    if (!raw) return 0;
+    const lines = raw.split("\n").filter(Boolean);
+    if (!lines.length) return 0;
+    const last = JSON.parse(lines[lines.length - 1]);
+    return Number(last?.seq || 0);
+  } catch {
+    return 0;
+  }
+};
+
+const initializePersistence = async () => {
+  const mongoConnected = await initializeMongo();
+
+  if (mongoConnected) {
+    await hydrateSoldiersFromMongo();
+    const lastReplay = await mongoCollections.replayEvents.find({}).sort({ seq: -1 }).limit(1).next();
+    replaySequence = Number(lastReplay?.seq || 0);
+    return;
+  }
+
+  replaySequence = bootstrapReplaySequenceFromFile();
 };
 
 const isHttpUrl = (value) => {
@@ -223,6 +335,114 @@ const readHeader = (headers, key) => {
     return value[0];
   }
   return typeof value === "string" ? value : undefined;
+};
+
+const toFiniteNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const roundTo = (value, decimals = 2) => {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+};
+
+const normalizeHeading = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  const normalized = parsed % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+};
+
+const classifyActivityFromImu = ({
+  accelMag = 9.81,
+  dynamicAccel = 0,
+  gyroMag = 0,
+  stepRateSpm = 0
+}) => {
+  let label = "standing";
+  let confidence = 0.58;
+
+  if (stepRateSpm >= 140 || dynamicAccel >= 4.2 || gyroMag >= 2.4) {
+    label = "running";
+    confidence = clamp(0.72 + Math.min(0.24, (stepRateSpm - 120) / 200), 0.55, 0.98);
+  } else if (
+    (gyroMag >= 1.2 && stepRateSpm < 25 && dynamicAccel >= 0.35 && dynamicAccel <= 2.4) ||
+    (accelMag <= 8.2 && gyroMag >= 0.9 && stepRateSpm < 18)
+  ) {
+    label = "crawling";
+    confidence = clamp(0.66 + Math.min(0.2, gyroMag / 8), 0.52, 0.95);
+  } else if (stepRateSpm >= 40 || dynamicAccel >= 1.05 || gyroMag >= 0.65) {
+    label = "walking";
+    confidence = clamp(0.64 + Math.min(0.22, stepRateSpm / 220), 0.5, 0.94);
+  } else if (dynamicAccel < 0.22 && gyroMag < 0.18 && stepRateSpm < 2) {
+    label = "idle";
+    confidence = 0.76;
+  } else {
+    label = "standing";
+    confidence = clamp(0.58 + Math.max(0, 0.2 - dynamicAccel), 0.5, 0.88);
+  }
+
+  return { label, confidence: roundTo(confidence, 3) };
+};
+
+const applyImuUpdateToSoldier = (soldier, payload = {}) => {
+  const nowIso = new Date().toISOString();
+  const ax = toFiniteNumber(payload?.accelerometer?.x, 0);
+  const ay = toFiniteNumber(payload?.accelerometer?.y, 0);
+  const az = toFiniteNumber(payload?.accelerometer?.z, 9.81);
+  const gx = toFiniteNumber(payload?.gyroscope?.x, 0);
+  const gy = toFiniteNumber(payload?.gyroscope?.y, 0);
+  const gz = toFiniteNumber(payload?.gyroscope?.z, 0);
+
+  const accelMag = Math.sqrt((ax * ax) + (ay * ay) + (az * az));
+  const dynamicAccel = Math.abs(accelMag - 9.81);
+  const gyroMag = Math.sqrt((gx * gx) + (gy * gy) + (gz * gz));
+
+  const explicitStepRate = Number(payload?.stepRateSpm);
+  let stepRateSpm = Number.isFinite(explicitStepRate) ? Math.max(0, explicitStepRate) : 0;
+
+  const stepDelta = toFiniteNumber(payload?.stepDelta, 0);
+  const sampleDurationSec = Math.max(0.1, toFiniteNumber(payload?.sampleDurationSec, 1));
+  if (!Number.isFinite(explicitStepRate) && stepDelta > 0) {
+    stepRateSpm = (stepDelta / sampleDurationSec) * 60;
+  }
+
+  const pitchRad = Math.atan2(ax, Math.sqrt((ay * ay) + (az * az)));
+  const rollRad = Math.atan2(ay, az);
+  const headingDeg = normalizeHeading(payload?.headingDeg);
+
+  const activity = classifyActivityFromImu({
+    accelMag,
+    dynamicAccel,
+    gyroMag,
+    stepRateSpm
+  });
+
+  soldier.imu = {
+    accelerometer: { x: roundTo(ax, 3), y: roundTo(ay, 3), z: roundTo(az, 3) },
+    gyroscope: { x: roundTo(gx, 3), y: roundTo(gy, 3), z: roundTo(gz, 3) },
+    accelMag: roundTo(accelMag, 3),
+    dynamicAccel: roundTo(dynamicAccel, 3),
+    gyroMag: roundTo(gyroMag, 3),
+    stepsTotal: Math.max(0, Math.trunc(toFiniteNumber(payload?.stepsTotal, payload?.stepCount ?? 0))),
+    stepDelta: Math.max(0, Math.trunc(stepDelta)),
+    stepRateSpm: roundTo(stepRateSpm, 2),
+    headingDeg,
+    pitchDeg: roundTo((pitchRad * 180) / Math.PI, 2),
+    rollDeg: roundTo((rollRad * 180) / Math.PI, 2),
+    updatedAt: String(payload?.timestamp || nowIso)
+  };
+
+  soldier.activity = activity.label;
+  soldier.activityConfidence = activity.confidence;
+  return {
+    activity: soldier.activity,
+    activityConfidence: soldier.activityConfidence,
+    imu: soldier.imu
+  };
 };
 
 const getSessionState = (sessionId) => {
@@ -461,6 +681,9 @@ const soldiers = [
     floor: 0,
     lifeStatus: "alive",
     healthStatus: "healthy",
+    activity: "walking",
+    activityConfidence: 0.64,
+    imu: null,
     engaged: true,
     firing: false,
     tampered: false
@@ -478,6 +701,9 @@ const soldiers = [
     floor: 2,
     lifeStatus: "alive",
     healthStatus: "injured",
+    activity: "running",
+    activityConfidence: 0.66,
+    imu: null,
     engaged: true,
     firing: true,
     tampered: false
@@ -495,6 +721,9 @@ const soldiers = [
     floor: 0,
     lifeStatus: "dead",
     healthStatus: "dead",
+    activity: "down",
+    activityConfidence: 1,
+    imu: null,
     engaged: false,
     firing: false,
     tampered: false
@@ -512,11 +741,52 @@ const soldiers = [
     floor: 4,
     lifeStatus: "alive",
     healthStatus: "healthy",
+    activity: "standing",
+    activityConfidence: 0.61,
+    imu: null,
     engaged: false,
     firing: false,
     tampered: true
   }
 ];
+
+const persistSoldier = async (soldier) => {
+  if (!isMongoReady()) return;
+  await mongoCollections.soldiers.updateOne(
+    { id: soldier.id },
+    { $set: { ...soldier, updatedAt: new Date().toISOString() } },
+    { upsert: true }
+  );
+};
+
+const persistImuEvent = async ({ soldier, payload }) => {
+  if (!isMongoReady()) return;
+  await mongoCollections.imuEvents.insertOne({
+    soldierId: soldier.id,
+    watchId: String(payload?.watchId ?? ""),
+    timestamp: String(payload?.timestamp || new Date().toISOString()),
+    ts: Date.now(),
+    imu: soldier.imu,
+    activity: soldier.activity,
+    activityConfidence: soldier.activityConfidence
+  });
+};
+
+const hydrateSoldiersFromMongo = async () => {
+  if (!isMongoReady()) return;
+  const docs = await mongoCollections.soldiers.find({}).sort({ id: 1 }).toArray();
+  if (!docs.length) {
+    await mongoCollections.soldiers.insertMany(
+      soldiers.map((item) => ({ ...item, updatedAt: new Date().toISOString() }))
+    );
+    return;
+  }
+
+  soldiers.splice(0, soldiers.length, ...docs.map((doc) => {
+    const { _id, updatedAt, ...rest } = doc;
+    return rest;
+  }));
+};
 
 const validStatuses = new Set(["alive", "injured", "dead", "healthy", "tampered"]);
 const streamClients = new Set();
@@ -559,6 +829,9 @@ const normalizeVector = (v) => {
 const describeActivity = (soldier) => {
   if (soldier.lifeStatus === "dead") return "down";
   if (soldier.firing) return "firing";
+  if (HUMAN_ACTIVITY_LABELS.has(String(soldier.activity || "").toLowerCase())) {
+    return String(soldier.activity).toLowerCase();
+  }
   if (soldier.engaged) return "engaged";
   return "moving";
 };
@@ -606,6 +879,9 @@ const normalizeAngle = (angle) => {
 const derivePacketActivity = (soldier, speedMps = 0) => {
   if (soldier.lifeStatus === "dead") return "down";
   if (soldier.firing) return "firing";
+  if (HUMAN_ACTIVITY_LABELS.has(String(soldier.activity || "").toLowerCase())) {
+    return String(soldier.activity).toLowerCase();
+  }
   if (speedMps >= 1.5) return "running";
   if (speedMps >= 0.3) return "moving";
   if (soldier.engaged) return "engaged";
@@ -622,6 +898,12 @@ const computeDirectionAngle = (soldier) => {
 
   let gunfireDir = previous?.gunfireDir ?? 0;
   let speedMps = previous?.speedMps ?? 0;
+  const imuHeading = normalizeHeading(soldier?.imu?.headingDeg);
+  const imuUpdatedAt = Date.parse(String(soldier?.imu?.updatedAt || ""));
+  const imuIsFresh = Number.isFinite(imuUpdatedAt) && (Date.now() - imuUpdatedAt) <= 10_000;
+  if (imuIsFresh && Number.isFinite(imuHeading)) {
+    gunfireDir = Number(imuHeading);
+  }
 
   if (previous) {
     const deltaTimeSec = Math.max(0.001, (current.tsMs - previous.tsMs) / 1000);
@@ -657,8 +939,10 @@ const buildSoldierPacket = (soldier) => {
     },
     origin_place: soldier.map ?? "Unknown",
     activity: derivePacketActivity(soldier, speedMps),
+    activity_confidence: Number(soldier.activityConfidence ?? 0),
     health: soldier.healthStatus ?? "unknown",
     gunfire_dir: gunfireDir,
+    heading_deg: Number.isFinite(Number(soldier?.imu?.headingDeg)) ? Number(soldier.imu.headingDeg) : null,
     timestamp: Date.now()
   };
 };
@@ -916,6 +1200,8 @@ app.get("/routes", (_req, res) => {
       "GET /intelligence/squad",
       "POST /soldiers/:id/engage",
       "POST /soldiers/:id/fire",
+      "POST /soldiers/:id/imu",
+      "POST /watch/imu-event",
       "POST /audio/detect-firing",
       "POST /watch/audio-event",
       "POST /watch/threat-assessment",
@@ -943,22 +1229,26 @@ app.get("/metrics", (_req, res) => {
   res.json(getMetrics());
 });
 
-const getOperationReplayLogFiles = (_req, res) => {
+const getOperationReplayLogFiles = async (_req, res) => {
+  const files = await listReplayLogFiles();
   return res.json({
     feature: "Operation Replay",
-    directory: REPLAY_LOG_DIR,
-    files: listReplayLogFiles()
+    storage: isMongoReady() ? "mongodb" : "jsonl_file",
+    directory: isMongoReady() ? MONGODB_DB : REPLAY_LOG_DIR,
+    files
   });
 };
 
 app.get("/operation-replay/log-files", getOperationReplayLogFiles);
 app.get("/replay/log-files", getOperationReplayLogFiles);
 
-const getOperationReplayLogs = (req, res) => {
+const getOperationReplayLogs = async (req, res) => {
   const { file = "", type = "", limit = REPLAY_DEFAULT_LIMIT } = req.query;
+  const replay = await loadReplayEvents({ file, type, limit });
   return res.json({
     feature: "Operation Replay",
-    ...loadReplayEvents({ file, type, limit })
+    storage: isMongoReady() ? "mongodb" : "jsonl_file",
+    ...replay
   });
 };
 
@@ -1027,6 +1317,9 @@ app.post("/soldiers/:id/engage", (req, res) => {
 
   const previousEngaged = soldier.engaged;
   soldier.engaged = Boolean(req.body?.engaged);
+  persistSoldier(soldier).catch((error) => {
+    console.error("[mongo] failed to persist soldier engage update:", error instanceof Error ? error.message : error);
+  });
   appendReplayEvent("soldier_engage_update", {
     id: soldier.id,
     previous: { engaged: previousEngaged },
@@ -1051,6 +1344,9 @@ app.post("/soldiers/:id/fire", (req, res) => {
 
   const previousFiring = soldier.firing;
   soldier.firing = Boolean(req.body?.firing);
+  persistSoldier(soldier).catch((error) => {
+    console.error("[mongo] failed to persist soldier fire update:", error instanceof Error ? error.message : error);
+  });
   appendReplayEvent("soldier_fire_update", {
     id: soldier.id,
     previous: { firing: previousFiring },
@@ -1064,6 +1360,78 @@ app.post("/soldiers/:id/fire", (req, res) => {
   pushLiveUpdate();
 
   return res.json({ ok: true, id: soldier.id, firing: soldier.firing });
+});
+
+app.post("/soldiers/:id/imu", async (req, res) => {
+  const soldier = soldiers.find((s) => s.id === req.params.id.toUpperCase());
+  if (!soldier) {
+    return res.status(404).json({ error: "Soldier not found" });
+  }
+
+  const update = applyImuUpdateToSoldier(soldier, req.body ?? {});
+  try {
+    await Promise.all([
+      persistSoldier(soldier),
+      persistImuEvent({ soldier, payload: req.body ?? {} })
+    ]);
+  } catch (error) {
+    console.error("[mongo] failed to persist IMU update:", error instanceof Error ? error.message : error);
+  }
+  appendReplayEvent("soldier_imu_update", {
+    id: soldier.id,
+    update,
+    source: {
+      ip: req.ip,
+      userAgent: req.headers["user-agent"] ?? null
+    }
+  });
+  pushLiveUpdate();
+
+  return res.json({
+    ok: true,
+    id: soldier.id,
+    activity: soldier.activity,
+    activityConfidence: soldier.activityConfidence,
+    imu: soldier.imu
+  });
+});
+
+app.post("/watch/imu-event", async (req, res) => {
+  const { watchId = "unknown-watch", soldierId } = req.body ?? {};
+  const resolvedId = String(soldierId || "").toUpperCase();
+  if (!resolvedId) {
+    return res.status(400).json({ error: "soldierId is required" });
+  }
+
+  const soldier = soldiers.find((s) => s.id === resolvedId);
+  if (!soldier) {
+    return res.status(404).json({ error: "Soldier not found" });
+  }
+
+  const update = applyImuUpdateToSoldier(soldier, req.body ?? {});
+  try {
+    await Promise.all([
+      persistSoldier(soldier),
+      persistImuEvent({ soldier, payload: req.body ?? {} })
+    ]);
+  } catch (error) {
+    console.error("[mongo] failed to persist watch IMU event:", error instanceof Error ? error.message : error);
+  }
+  appendReplayEvent("watch_imu_event", {
+    watchId,
+    soldierId: soldier.id,
+    update
+  });
+  pushLiveUpdate();
+
+  return res.json({
+    ok: true,
+    watchId,
+    soldierId: soldier.id,
+    activity: soldier.activity,
+    activityConfidence: soldier.activityConfidence,
+    imu: soldier.imu
+  });
 });
 
 app.post("/audio/detect-firing", (req, res) => {
@@ -1335,14 +1703,26 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`War Room API running at http://localhost:${PORT}`);
-  console.log(`War Room WebSocket stream at ws://localhost:${PORT}/ws`);
-  console.log(
-    `Operation Replay writes: ${OPERATION_REPLAY_WRITE_ENABLED ? "enabled" : "disabled"} (set OPERATION_REPLAY_WRITE_ENABLED=true to enable)`
-  );
-  appendReplayEvent("system_start", {
-    port: PORT,
-    operationReplayLogFile: path.basename(ensureReplayLogFile())
-  });
-});
+const startServer = async () => {
+  try {
+    await initializePersistence();
+    server.listen(PORT, () => {
+      console.log(`War Room API running at http://localhost:${PORT}`);
+      console.log(`War Room WebSocket stream at ws://localhost:${PORT}/ws`);
+      console.log(
+        `Operation Replay writes: ${OPERATION_REPLAY_WRITE_ENABLED ? "enabled" : "disabled"} (set OPERATION_REPLAY_WRITE_ENABLED=true to enable)`
+      );
+      console.log(`Persistence: ${isMongoReady() ? `MongoDB(${MONGODB_DB})` : "local in-memory + optional JSONL"}`);
+      appendReplayEvent("system_start", {
+        port: PORT,
+        storage: isMongoReady() ? "mongodb" : "local",
+        operationReplayLogFile: OPERATION_REPLAY_WRITE_ENABLED ? path.basename(ensureReplayLogFile()) : null
+      });
+    });
+  } catch (error) {
+    console.error("[startup] failed:", error instanceof Error ? error.message : error);
+    process.exit(1);
+  }
+};
+
+startServer();

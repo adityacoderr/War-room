@@ -72,6 +72,13 @@ const normalizeSoldier = (raw, index) => {
     floor: Math.max(0, Math.trunc(clampNumber(raw?.floor, 0, 200, 0))),
     lifeStatus,
     healthStatus,
+    activity: String(raw?.activity || "unknown").toLowerCase(),
+    activityConfidence: clampNumber(raw?.activityConfidence, 0, 1, 0),
+    imu: {
+      headingDeg: Number.isFinite(Number(raw?.imu?.headingDeg)) ? Number(raw.imu.headingDeg) : null,
+      stepRateSpm: Number.isFinite(Number(raw?.imu?.stepRateSpm)) ? Number(raw.imu.stepRateSpm) : null,
+      updatedAt: String(raw?.imu?.updatedAt || "")
+    },
     engaged: Boolean(raw?.engaged),
     firing: Boolean(raw?.firing),
     tampered: Boolean(raw?.tampered)
@@ -1445,22 +1452,31 @@ export default function App() {
         <article className="panel latest-panel">
           <h2>Latest Soldier Update</h2>
           {selectedSoldier ? (
-            <div className="detail-grid">
-              <div className="detail-row"><span>ID</span><strong>{selectedSoldier.id}</strong></div>
-              <div className="detail-row"><span>Map</span><strong>{selectedSoldier.map}</strong></div>
-              <div className="detail-row"><span>Coordinates</span><strong>{selectedSoldier.coordinates.lat}, {selectedSoldier.coordinates.lng}</strong></div>
-              <div className="detail-row"><span>Altitude</span><strong>{selectedSoldier.altitude}</strong></div>
-              <div className="detail-row"><span>SpO2</span><strong>{selectedSoldier.spo2}</strong></div>
-              <div className="detail-row"><span>Blood Oxygen</span><strong>{selectedSoldier.bloodOxygenLevel}</strong></div>
-              <div className="detail-row"><span>BP</span><strong>{selectedSoldier.bloodPressure.systolic}/{selectedSoldier.bloodPressure.diastolic}</strong></div>
-              <div className="detail-row"><span>MAP</span><strong>{selectedSoldier.mapValue}</strong></div>
-              <div className="detail-row"><span>Floor</span><strong>{selectedSoldier.floor}</strong></div>
-              <div className="detail-row"><span>Life</span><strong>{selectedSoldier.lifeStatus}</strong></div>
-              <div className="detail-row"><span>Health</span><strong>{selectedSoldier.healthStatus}</strong></div>
-              <div className="detail-row"><span>Tampered</span><strong>{selectedSoldier.tampered ? "YES" : "NO"}</strong></div>
-              <div className="detail-row"><span>Engage</span><strong>{selectedSoldier.engaged ? "YES" : "NO"}</strong></div>
-              <div className="detail-row"><span>Fire</span><strong>{selectedSoldier.firing ? "YES" : "NO"}</strong></div>
-            </div>
+            <>
+              <p className="activity-callout">
+                {selectedSoldier.name} is {selectedSoldier.activity}
+              </p>
+              <div className="detail-grid">
+                <div className="detail-row"><span>ID</span><strong>{selectedSoldier.id}</strong></div>
+                <div className="detail-row"><span>Map</span><strong>{selectedSoldier.map}</strong></div>
+                <div className="detail-row"><span>Coordinates</span><strong>{selectedSoldier.coordinates.lat}, {selectedSoldier.coordinates.lng}</strong></div>
+                <div className="detail-row"><span>Activity</span><strong>{selectedSoldier.activity}</strong></div>
+                <div className="detail-row"><span>Activity Confidence</span><strong>{Math.round(selectedSoldier.activityConfidence * 100)}%</strong></div>
+                <div className="detail-row"><span>IMU Heading</span><strong>{selectedSoldier.imu.headingDeg == null ? "-" : `${Math.round(selectedSoldier.imu.headingDeg)}°`}</strong></div>
+                <div className="detail-row"><span>Step Rate</span><strong>{selectedSoldier.imu.stepRateSpm == null ? "-" : `${Math.round(selectedSoldier.imu.stepRateSpm)} spm`}</strong></div>
+                <div className="detail-row"><span>Altitude</span><strong>{selectedSoldier.altitude}</strong></div>
+                <div className="detail-row"><span>SpO2</span><strong>{selectedSoldier.spo2}</strong></div>
+                <div className="detail-row"><span>Blood Oxygen</span><strong>{selectedSoldier.bloodOxygenLevel}</strong></div>
+                <div className="detail-row"><span>BP</span><strong>{selectedSoldier.bloodPressure.systolic}/{selectedSoldier.bloodPressure.diastolic}</strong></div>
+                <div className="detail-row"><span>MAP</span><strong>{selectedSoldier.mapValue}</strong></div>
+                <div className="detail-row"><span>Floor</span><strong>{selectedSoldier.floor}</strong></div>
+                <div className="detail-row"><span>Life</span><strong>{selectedSoldier.lifeStatus}</strong></div>
+                <div className="detail-row"><span>Health</span><strong>{selectedSoldier.healthStatus}</strong></div>
+                <div className="detail-row"><span>Tampered</span><strong>{selectedSoldier.tampered ? "YES" : "NO"}</strong></div>
+                <div className="detail-row"><span>Engage</span><strong>{selectedSoldier.engaged ? "YES" : "NO"}</strong></div>
+                <div className="detail-row"><span>Fire</span><strong>{selectedSoldier.firing ? "YES" : "NO"}</strong></div>
+              </div>
+            </>
           ) : (
             <p>Select a soldier marker on the 2D map to view latest updates.</p>
           )}
@@ -1693,6 +1709,7 @@ export default function App() {
                   <th>MAP</th>
                   <th>Map</th>
                   <th>Coordinates</th>
+                  <th>Activity</th>
                   <th>Floor</th>
                   <th>Status</th>
                   <th>Engage</th>
@@ -1714,6 +1731,7 @@ export default function App() {
                     <td>{soldier.mapValue}</td>
                     <td>{soldier.map}</td>
                     <td>{soldier.coordinates.lat}, {soldier.coordinates.lng}</td>
+                    <td>{soldier.activity}</td>
                     <td>{soldier.floor}</td>
                     <td>
                       <span className={`pill ${statusColorClass(soldier)}`}>
