@@ -11,6 +11,8 @@ import { inferFiringFromAudio, inferFiringWithDiagnostics } from "./audioInferen
 
 const app = express();
 const PORT = 4000;
+const EXTERNAL_WATCH_URL = String(process.env.EXTERNAL_WATCH_URL ?? "http://192.168.137.135/").trim();
+const EXTERNAL_WATCH_TIMEOUT_MS = Number(process.env.EXTERNAL_WATCH_TIMEOUT_MS ?? 4000);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const KNOWN_GUN_TYPES = new Set(["ak47", "m16", "glock", "pistol", "shotgun", "sniper", "smg", "lmg", "hmg"]);
@@ -25,6 +27,7 @@ const MONGODB_URI = String(process.env.MONGODB_URI ?? process.env.MONGO_URI ?? "
 const MONGODB_DB = String(process.env.MONGODB_DB ?? "war_room").trim();
 const MONGODB_ENABLED = MONGODB_URI.length > 0;
 const MONGO_REPLAY_FILE_NAME = "operation-replay-mongodb";
+const WATCH_KEYWORD_TYPES = new Set(["ENEMY", "HELP", "FALLBACK", "AMBUSH"]);
 
 let replaySequence = 0;
 let replayLogFilePath = "";
@@ -35,9 +38,358 @@ let mongoCollections = {
   imuEvents: null,
   replayEvents: null
 };
+const externalWatchMemory = new Map();
+const watchKeywordAlerts = [];
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+
+const average = (values) => {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (!finite.length) return 0;
+  return finite.reduce((sum, value) => sum + value, 0) / finite.length;
+};
+
+const projectCoordinateByDistance = ({ lat, lng, bearingDeg, meters }) => {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (!Number.isFinite(bearingDeg) || !Number.isFinite(meters)) return null;
+
+  const bearingRadians = (bearingDeg * Math.PI) / 180;
+  const latitudeRadians = (lat * Math.PI) / 180;
+  const deltaLat = (meters * Math.cos(bearingRadians)) / 111_320;
+  const lngScale = 111_320 * Math.max(Math.cos(latitudeRadians), 0.00001);
+  const deltaLng = (meters * Math.sin(bearingRadians)) / lngScale;
+
+  return {
+    lat: lat + deltaLat,
+    lng: lng + deltaLng
+  };
+};
+
+const decodeHealthCode = (value) => {
+  if (value === 0 || value === "0") return { lifeStatus: "alive", healthStatus: "healthy" };
+  if (value === 1 || value === "1") return { lifeStatus: "alive", healthStatus: "injured" };
+  if (value === 2 || value === "2") return { lifeStatus: "dead", healthStatus: "dead" };
+  return { lifeStatus: "alive", healthStatus: "healthy" };
+};
+
+const recordWatchKeywordAlert = ({ watchName, watchId, keyword, message = "" }) => {
+  const entry = {
+    id: `watch-alert-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    watchId: String(watchId || watchName || "unknown-watch"),
+    watchName: String(watchName || watchId || "Unknown Watch"),
+    keyword: String(keyword || "").toUpperCase(),
+    message: String(message || ""),
+    receivedAt: new Date().toISOString()
+  };
+
+  watchKeywordAlerts.unshift(entry);
+  if (watchKeywordAlerts.length > 20) {
+    watchKeywordAlerts.length = 20;
+  }
+
+  return entry;
+};
+
+const parseWatchHtml = (html) => {
+  const match = String(html || "").match(/<pre>([\s\S]*?)<\/pre>/i);
+  return match ? match[1] : "";
+};
+
+const parseWatchBlocks = (text) => {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const blocks = [];
+  let current = null;
+
+  for (const line of lines) {
+    if (line.startsWith("====== TX")) {
+      current = { type: "tx", lines: [] };
+      continue;
+    }
+    if (line.startsWith("------ RX")) {
+      current = { type: "rx", lines: [] };
+      continue;
+    }
+    if (line.includes("==============================") || line.includes("------------------------------")) {
+      if (current?.lines?.length) {
+        blocks.push(current);
+      }
+      current = null;
+      continue;
+    }
+    if (current) {
+      current.lines.push(line);
+    }
+  }
+
+  if (current?.lines?.length) {
+    blocks.push(current);
+  }
+
+  return blocks;
+};
+
+const parseWatchValueBlock = (block) => {
+  const payload = {};
+  for (const line of block.lines) {
+    const [rawKey, ...rest] = line.split(":");
+    if (!rawKey || !rest.length) continue;
+    payload[rawKey.trim().toLowerCase()] = rest.join(":").trim();
+  }
+  return payload;
+};
+
+const normalizeExternalWatchSoldiers = (blocks) => {
+  const extracted = blocks
+    .map((block, index) => ({ ...block, data: parseWatchValueBlock(block), index }))
+    .map(({ type, data, index }) => {
+      const watchId = String(data.watch || `${type}-${index + 1}`);
+      const lat = Number(data.lat);
+      const lng = Number(data.lon);
+      const distance = Number(data.distance);
+      const heading = Number(data.heading);
+      const rssi = Number(data.rssi);
+      const hr = Number(data.hr);
+      const health = Number(data.health);
+      const hasCoords = Number.isFinite(lat) && Number.isFinite(lng) && (Math.abs(lat) > 0.000001 || Math.abs(lng) > 0.000001);
+
+      return {
+        id: `WATCH-${watchId}`,
+        watchId,
+        type,
+        lat: hasCoords ? lat : null,
+        lng: hasCoords ? lng : null,
+        distance: Number.isFinite(distance) ? distance : null,
+        heading: Number.isFinite(heading) ? heading : null,
+        rssi: Number.isFinite(rssi) ? rssi : null,
+        hr: Number.isFinite(hr) ? hr : null,
+        health: Number.isFinite(health) ? health : null,
+        raw: data
+      };
+    });
+
+  const deduped = [...extracted.reduce((map, item) => {
+    const existing = map.get(item.watchId);
+    if (!existing) {
+      map.set(item.watchId, item);
+      return map;
+    }
+
+    const prefersCurrentType = existing.type !== "tx" && item.type === "tx";
+    const prefersCurrentCoords = (existing.lat == null || existing.lng == null) && item.lat != null && item.lng != null;
+    const prefersCurrentHealth = existing.health == null && item.health != null;
+    const prefersCurrentSignal = existing.rssi == null && item.rssi != null;
+
+    if (prefersCurrentType || prefersCurrentCoords || prefersCurrentHealth || prefersCurrentSignal) {
+      map.set(item.watchId, item);
+    }
+
+    return map;
+  }, new Map()).values()];
+
+  const watch2 = deduped.find((item) => item.watchId === "2") || null;
+  const watch2Previous = watch2 ? externalWatchMemory.get(watch2.id) || null : null;
+  const watch2PreviousLat = Number(watch2Previous?.coordinates?.lat);
+  const watch2PreviousLng = Number(watch2Previous?.coordinates?.lng);
+  const watch2PreviousUsable =
+    Number.isFinite(watch2PreviousLat) &&
+    Number.isFinite(watch2PreviousLng) &&
+    (Math.abs(watch2PreviousLat) > 0.000001 || Math.abs(watch2PreviousLng) > 0.000001);
+  const anchorSource =
+    deduped.find((item) => item.watchId === "2" && item.lat != null && item.lng != null) ||
+    deduped.find((item) => item.lat != null && item.lng != null) ||
+    null;
+  const anchorLat = anchorSource?.lat ?? (watch2PreviousUsable ? watch2PreviousLat : average(deduped.map((item) => item.lat)));
+  const anchorLng = anchorSource?.lng ?? (watch2PreviousUsable ? watch2PreviousLng : average(deduped.map((item) => item.lng)));
+
+  return deduped.map((item, index) => {
+    const previous = externalWatchMemory.get(item.id) || null;
+    let lat = item.lat;
+    let lng = item.lng;
+    const heartRate = Number.isFinite(item.hr) ? item.hr : 0;
+    const canAnchorToSquad = Number.isFinite(anchorLat) && Number.isFinite(anchorLng) && (Math.abs(anchorLat) > 0.000001 || Math.abs(anchorLng) > 0.000001);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      const previousLat = Number(previous?.coordinates?.lat);
+      const previousLng = Number(previous?.coordinates?.lng);
+      const previousIsUsable =
+        Number.isFinite(previousLat) &&
+        Number.isFinite(previousLng) &&
+        (Math.abs(previousLat) > 0.000001 || Math.abs(previousLng) > 0.000001) &&
+        previous?.source?.placeholderPosition === false;
+      const projectedRelativePosition =
+        item.watchId === "1" && canAnchorToSquad
+          ? projectCoordinateByDistance({
+              lat: anchorLat,
+              lng: anchorLng,
+              bearingDeg: item.heading,
+              meters: item.distance
+            })
+          : null;
+
+      if (item.watchId === "2" && watch2PreviousUsable) {
+        lat = watch2PreviousLat;
+        lng = watch2PreviousLng;
+      } else if (projectedRelativePosition) {
+        lat = projectedRelativePosition.lat;
+        lng = projectedRelativePosition.lng;
+      } else if (previousIsUsable) {
+        lat = previous.coordinates.lat;
+        lng = previous.coordinates.lng;
+      } else if (canAnchorToSquad) {
+        lat = anchorLat + (index + 1) * 0.00012;
+        lng = anchorLng + (index + 1) * 0.00012;
+      } else {
+        lat = 28.6139 + index * 0.00012;
+        lng = 77.209 + index * 0.00012;
+      }
+    }
+
+    const { lifeStatus, healthStatus } = decodeHealthCode(item.health);
+    const soldier = {
+      id: item.id,
+      name: `Watch ${item.watchId}`,
+      altitude: 0,
+      bloodOxygenLevel: 0,
+      bloodPressure: {
+        systolic: heartRate,
+        diastolic: heartRate
+      },
+      mapValue: 0,
+      map: "Watch",
+      coordinates: {
+        x: 0,
+        y: 0,
+        lat,
+        lng
+      },
+      floor: 0,
+      lifeStatus,
+      healthStatus,
+      activity: "active",
+      activityConfidence: 0.9,
+      imu: {
+        headingDeg: item.heading,
+        stepRateSpm: null,
+        updatedAt: new Date().toISOString()
+      },
+      engaged: item.type === "rx",
+      firing: false,
+      tampered: false,
+      source: {
+        stream: "external_watch_html",
+        blockType: item.type,
+        hasGpsFix: item.lat != null && item.lng != null,
+        placeholderPosition: item.lat == null || item.lng == null,
+        rssi: item.rssi,
+        distanceMeters: item.distance,
+        heartRate: item.hr,
+        healthCode: item.health,
+        raw: item.raw
+      }
+    };
+
+    externalWatchMemory.set(item.id, soldier);
+    return soldier;
+  });
+};
+
+const buildExternalWatchMetrics = (watchSoldiers) => {
+  const gpsKnown = watchSoldiers.filter((soldier) => !soldier.source?.placeholderPosition).length;
+  const placeholderCount = watchSoldiers.length - gpsKnown;
+  const rssiValues = watchSoldiers.map((soldier) => Number(soldier.source?.rssi));
+  const distanceValues = watchSoldiers.map((soldier) => Number(soldier.source?.distanceMeters));
+
+  return {
+    total: watchSoldiers.length,
+    alive: watchSoldiers.length,
+    injured: watchSoldiers.filter((soldier) => soldier.healthStatus === "injured").length,
+    dead: 0,
+    healthy: watchSoldiers.filter((soldier) => soldier.healthStatus === "healthy").length,
+    tampered: 0,
+    avgAltitude: 0,
+    avgBloodOxygen: 0,
+    gpsKnown,
+    placeholderCount,
+    avgRssi: Number(average(rssiValues).toFixed(2)),
+    avgDistanceMeters: Number(average(distanceValues).toFixed(2))
+  };
+};
+
+const buildExternalWatchSquadIntel = (watchSoldiers, parsedText) => ({
+  source: "external_watch_html",
+  summary: {
+    activeWatches: watchSoldiers.length,
+    gpsKnown: watchSoldiers.filter((soldier) => !soldier.source?.placeholderPosition).length,
+    placeholderPositions: watchSoldiers.filter((soldier) => soldier.source?.placeholderPosition).length
+  },
+  patterns: {
+    ambushDetection: { detected: false, gunfireDetected: false, suddenStops: 0 },
+    squadSplit: {
+      detected: watchSoldiers.some((soldier) => Number.isFinite(Number(soldier.source?.distanceMeters)) && Number(soldier.source?.distanceMeters) > 10),
+      maxDistanceMeters: Math.max(0, ...watchSoldiers.map((soldier) => Number(soldier.source?.distanceMeters) || 0)),
+      thresholdMeters: 10
+    },
+    coordinatedMovement: {
+      detected: watchSoldiers.length > 1,
+      parallelScore: 0.5,
+      movingSoldiers: watchSoldiers.length
+    },
+    soldierIsolation: {
+      detected: watchSoldiers.length <= 1,
+      isolatedCount: watchSoldiers.length <= 1 ? watchSoldiers.length : 0,
+      thresholdMeters: 80
+    }
+  },
+  alerts: watchSoldiers
+    .filter((soldier) => soldier.source?.placeholderPosition)
+    .map((soldier) => ({
+      type: "placeholder_position",
+      title: `${soldier.name} missing GPS`,
+      message: "Map position is using a local placeholder until the watch reports valid latitude and longitude.",
+      severity: "warning"
+    })),
+  rawText: parsedText
+});
+
+const loadExternalWatchPayload = async (targetUrl = EXTERNAL_WATCH_URL) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), EXTERNAL_WATCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(targetUrl, {
+      signal: controller.signal,
+      headers: { accept: "text/html, text/plain;q=0.9,*/*;q=0.8" }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Upstream watch host responded with ${response.status}`);
+    }
+
+    const html = await response.text();
+    const parsedText = parseWatchHtml(html);
+    const blocks = parseWatchBlocks(parsedText);
+    const watchSoldiers = normalizeExternalWatchSoldiers(blocks);
+    const metrics = buildExternalWatchMetrics(watchSoldiers);
+    const squadIntelligence = buildExternalWatchSquadIntel(watchSoldiers, parsedText);
+
+    return {
+      ok: true,
+      source: targetUrl,
+      fetchedAt: new Date().toISOString(),
+      soldiers: watchSoldiers,
+      metrics,
+      squadIntelligence,
+      rawText: parsedText
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
 const isMongoReady = () => Boolean(mongoDb && mongoCollections.soldiers && mongoCollections.replayEvents);
 
@@ -335,6 +687,45 @@ const readHeader = (headers, key) => {
     return value[0];
   }
   return typeof value === "string" ? value : undefined;
+};
+
+const resolveKeywordFromText = (value) => {
+  const text = String(value || "").toUpperCase();
+  if (!text) return null;
+  for (const keyword of WATCH_KEYWORD_TYPES) {
+    const pattern = new RegExp(`\\b${keyword}\\b`, "i");
+    if (pattern.test(text)) {
+      return keyword;
+    }
+  }
+  return null;
+};
+
+const extractIncomingKeywordAlert = ({ payload, headers, watchId, watchName }) => {
+  const directKeyword = resolveKeywordFromText(payload?.keyword || readHeader(headers, "x-watch-keyword"));
+  const transcriptKeyword = resolveKeywordFromText(
+    payload?.transcript ||
+    payload?.text ||
+    payload?.message ||
+    readHeader(headers, "x-watch-transcript") ||
+    readHeader(headers, "x-watch-text")
+  );
+  const keyword = directKeyword || transcriptKeyword;
+  if (!keyword) return null;
+
+  return recordWatchKeywordAlert({
+    watchId,
+    watchName: watchName || payload?.watchName || watchId,
+    keyword,
+    message: String(
+      payload?.message ||
+      payload?.transcript ||
+      payload?.text ||
+      readHeader(headers, "x-watch-transcript") ||
+      readHeader(headers, "x-watch-text") ||
+      ""
+    ).trim()
+  });
 };
 
 const toFiniteNumber = (value, fallback = 0) => {
@@ -672,7 +1063,6 @@ const soldiers = [
     id: "ALPHA-01",
     name: "Unit A1",
     altitude: 14,
-    spo2: 95,
     bloodOxygenLevel: 95,
     bloodPressure: { systolic: 118, diastolic: 76 },
     mapValue: 90,
@@ -692,7 +1082,6 @@ const soldiers = [
     id: "ALPHA-02",
     name: "Unit A2",
     altitude: 31,
-    spo2: 91,
     bloodOxygenLevel: 90,
     bloodPressure: { systolic: 122, diastolic: 82 },
     mapValue: 95,
@@ -712,7 +1101,6 @@ const soldiers = [
     id: "BRAVO-03",
     name: "Unit B3",
     altitude: 12,
-    spo2: 0,
     bloodOxygenLevel: 0,
     bloodPressure: { systolic: 0, diastolic: 0 },
     mapValue: 0,
@@ -732,12 +1120,11 @@ const soldiers = [
     id: "CHARLIE-04",
     name: "Unit C4",
     altitude: 46,
-    spo2: 95,
     bloodOxygenLevel: 94,
     bloodPressure: { systolic: 128, diastolic: 84 },
     mapValue: 98,
     map: "Sector-South",
-    coordinates: { x: 84, y: 86, lat: 28.6178, lng: 77.2122 },
+    coordinates: { x: 60, y: 62, lat: 28.6154, lng: 77.2105 },
     floor: 4,
     lifeStatus: "alive",
     healthStatus: "healthy",
@@ -1132,7 +1519,6 @@ const getMetrics = () => {
   const tampered = soldiers.filter((s) => s.tampered).length;
 
   const avgAltitude = Number((soldiers.reduce((a, s) => a + s.altitude, 0) / total).toFixed(2));
-  const avgSpo2 = Number((soldiers.reduce((a, s) => a + s.spo2, 0) / total).toFixed(2));
   const avgBloodOxygen = Number(
     (soldiers.reduce((a, s) => a + s.bloodOxygenLevel, 0) / total).toFixed(2)
   );
@@ -1145,7 +1531,6 @@ const getMetrics = () => {
     healthy,
     tampered,
     avgAltitude,
-    avgSpo2,
     avgBloodOxygen
   };
 };
@@ -1186,6 +1571,8 @@ app.get("/routes", (_req, res) => {
     routes: [
       "GET /health",
       "GET /routes",
+      "GET /external-watch/live",
+      "GET /watch/keyword-alerts/latest",
       "GET /stream",
       "WS  /ws",
       "GET /operation-replay/log-files",
@@ -1202,12 +1589,41 @@ app.get("/routes", (_req, res) => {
       "POST /soldiers/:id/fire",
       "POST /soldiers/:id/imu",
       "POST /watch/imu-event",
+      "POST /watch/keyword-alert",
       "POST /audio/detect-firing",
       "POST /watch/audio-event",
       "POST /watch/threat-assessment",
       "POST /bluetooth/audio-event",
       "POST /bluetooth/threat-assessment"
     ]
+  });
+});
+
+app.get("/external-watch/live", async (req, res) => {
+  const targetUrl = String(req.query.url || EXTERNAL_WATCH_URL).trim();
+
+  try {
+    const payload = await loadExternalWatchPayload(targetUrl);
+    return res.json(payload);
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      source: targetUrl,
+      error: error instanceof Error ? error.message : "Unable to load external watch host",
+      fetchedAt: new Date().toISOString(),
+      soldiers: [],
+      metrics: buildExternalWatchMetrics([]),
+      squadIntelligence: buildExternalWatchSquadIntel([], "")
+    });
+  }
+});
+
+app.get("/watch/keyword-alerts/latest", (_req, res) => {
+  const latest = watchKeywordAlerts[0] || null;
+  return res.json({
+    ok: true,
+    latest,
+    total: watchKeywordAlerts.length
   });
 });
 
@@ -1434,6 +1850,38 @@ app.post("/watch/imu-event", async (req, res) => {
   });
 });
 
+app.post("/watch/keyword-alert", (req, res) => {
+  const rawKeyword = String(req.body?.keyword || "").trim().toUpperCase();
+  const watchName = String(req.body?.watchName || req.body?.watchId || "Unknown Watch").trim();
+  const watchId = String(req.body?.watchId || watchName).trim();
+  const message = String(req.body?.message || "").trim();
+
+  if (!WATCH_KEYWORD_TYPES.has(rawKeyword)) {
+    return res.status(400).json({
+      error: `keyword must be one of: ${Array.from(WATCH_KEYWORD_TYPES).join(", ")}`
+    });
+  }
+
+  const alert = recordWatchKeywordAlert({
+    watchName,
+    watchId,
+    keyword: rawKeyword,
+    message
+  });
+
+  appendReplayEvent("watch_keyword_alert", {
+    watchId,
+    watchName,
+    keyword: rawKeyword,
+    message
+  });
+
+  return res.json({
+    ok: true,
+    alert
+  });
+});
+
 app.post("/audio/detect-firing", (req, res) => {
   try {
     const inference = inferFiringFromAudio(req.body);
@@ -1461,11 +1909,21 @@ app.post("/watch/audio-event", async (req, res) => {
     const { watchId = "unknown-watch", callbackUrl } = req.body ?? {};
     const inference = inferFiringFromAudio(req.body);
     const result = inference.result;
+    const keywordAlert = extractIncomingKeywordAlert({
+      payload: req.body ?? {},
+      headers: req.headers,
+      watchId,
+      watchName: req.body?.watchName || watchId
+    });
 
     const response = {
       watchId,
       result
     };
+    if (keywordAlert) {
+      response.keywordAlert = keywordAlert;
+      appendReplayEvent("watch_keyword_alert", keywordAlert);
+    }
 
     if (typeof callbackUrl === "string" && callbackUrl.trim().length > 0) {
       if (!isHttpUrl(callbackUrl)) {
@@ -1499,6 +1957,12 @@ app.post("/watch/threat-assessment", async (req, res) => {
     const { watchId = "unknown-watch", callbackUrl, soldierGunName } = req.body ?? {};
     const inference = inferFiringWithDiagnostics(req.body);
     const assessment = buildThreatAssessment({ soldierGunName, inference });
+    const keywordAlert = extractIncomingKeywordAlert({
+      payload: req.body ?? {},
+      headers: req.headers,
+      watchId,
+      watchName: req.body?.watchName || watchId
+    });
 
     const response = {
       watchId,
@@ -1507,6 +1971,10 @@ app.post("/watch/threat-assessment", async (req, res) => {
       assessment,
       diagnostics: inference.diagnostics
     };
+    if (keywordAlert) {
+      response.keywordAlert = keywordAlert;
+      appendReplayEvent("watch_keyword_alert", keywordAlert);
+    }
 
     if (typeof callbackUrl === "string" && callbackUrl.trim().length > 0) {
       if (!isHttpUrl(callbackUrl)) {
@@ -1545,11 +2013,18 @@ app.post("/bluetooth/audio-event", express.raw({ type: BLUETOOTH_RAW_TYPES, limi
   try {
     const payload = buildBluetoothInferencePayload(req);
     const watchId = payload.watchId ?? readHeader(req.headers, "x-watch-id") ?? "unknown-watch";
+    const watchName = payload.watchName ?? readHeader(req.headers, "x-watch-name") ?? watchId;
     const sessionId =
       payload.sessionId ?? readHeader(req.headers, "x-session-id") ?? readHeader(req.headers, "x-stream-id") ?? watchId;
     const callbackUrl = payload.callbackUrl ?? readHeader(req.headers, "x-callback-url");
     const inference = inferFiringFromAudio(payload);
     const aggregated = appendChunkAndAggregate({ sessionId, inference });
+    const keywordAlert = extractIncomingKeywordAlert({
+      payload,
+      headers: req.headers,
+      watchId,
+      watchName
+    });
 
     const response = {
       watchId,
@@ -1559,6 +2034,10 @@ app.post("/bluetooth/audio-event", express.raw({ type: BLUETOOTH_RAW_TYPES, limi
       sessionId,
       source: "bluetooth"
     };
+    if (keywordAlert) {
+      response.keywordAlert = keywordAlert;
+      appendReplayEvent("watch_keyword_alert", keywordAlert);
+    }
 
     if (typeof callbackUrl === "string" && callbackUrl.trim().length > 0) {
       if (!isHttpUrl(callbackUrl)) {
@@ -1599,6 +2078,7 @@ app.post(
     try {
       const payload = buildBluetoothInferencePayload(req);
       const watchId = payload.watchId ?? readHeader(req.headers, "x-watch-id") ?? "unknown-watch";
+      const watchName = payload.watchName ?? readHeader(req.headers, "x-watch-name") ?? watchId;
       const sessionId =
         payload.sessionId ??
         readHeader(req.headers, "x-session-id") ??
@@ -1611,6 +2091,12 @@ app.post(
         readHeader(req.headers, "x-soldier-gun");
       const inference = inferFiringWithDiagnostics(payload);
       const aggregated = appendChunkAndAggregate({ sessionId, inference });
+      const keywordAlert = extractIncomingKeywordAlert({
+        payload,
+        headers: req.headers,
+        watchId,
+        watchName
+      });
       const assessment = buildThreatAssessment({
         soldierGunName,
         inference: {
@@ -1638,6 +2124,10 @@ app.post(
         diagnostics: inference.diagnostics,
         source: "bluetooth"
       };
+      if (keywordAlert) {
+        response.keywordAlert = keywordAlert;
+        appendReplayEvent("watch_keyword_alert", keywordAlert);
+      }
 
       if (typeof callbackUrl === "string" && callbackUrl.trim().length > 0) {
         if (!isHttpUrl(callbackUrl)) {
